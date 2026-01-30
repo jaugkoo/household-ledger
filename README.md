@@ -13,6 +13,8 @@ This is a Python automation script that monitors a OneDrive folder for receipt p
 -   **Error Correction**: Automatically re-analyzes images and corrects data when validation errors are detected.
 -   **Date-Based Organization**: Ensures all entries have valid dates for proper chronological sorting.
 -   **Source Tracking**: Tracks which image file each entry came from for accurate error correction.
+-   **Persistent History**: Remembers processed files across restarts using `.processed_history`.
+-   **Automatic Archiving**: Moves processed receipts to `Archive/YYYY/MM/` to keep your camera roll clean.
 
 ## Prerequisites
 
@@ -108,6 +110,8 @@ ENABLE_AUTO_CORRECTION=true      # Re-analyzes images when errors are detected
 ### Main Files
 -   `main.py`: The main automation script.
 -   `notion_validator.py`: Data validation and duplicate detection module.
+-   `history_manager.py`: Persistent file tracking utility.
+-   `archiver.py`: Date-based file archiving utility.
 
 ### Installation & Setup
 -   `install.bat`: One-click installer with auto-start setup.

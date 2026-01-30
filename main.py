@@ -10,6 +10,8 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from openai import OpenAI
 from notion_validator import NotionValidator
+from history_manager import HistoryManager
+from archiver import FileArchiver
 
 # Setup logging
 logging.basicConfig(level=logging.INFO,
@@ -32,21 +34,25 @@ ENABLE_AUTO_CORRECTION = os.getenv("ENABLE_AUTO_CORRECTION", "true").lower() == 
 # Initialize OpenAI client
 client = OpenAI(api_key=OPEN_AI_API_KEY)
 
-# Initialize Notion Validator
-notion_validator = NotionValidator(NOTION_TOKEN, NOTION_DATABASE_ID)
-
-# Keep track of processed files to avoid duplicates
-PROCESSED_FILES = set()
+# Initialize managers
+history_manager = HistoryManager()
+file_archiver = FileArchiver(WATCH_DIR) if WATCH_DIR else None
+notion_validator = NotionValidator(NOTION_TOKEN, NOTION_DATABASE_ID) if (NOTION_TOKEN and NOTION_DATABASE_ID) else None
 
 # Track image file paths for error correction
 IMAGE_FILE_TRACKER = {}  # {(date, merchant): filepath}
 
-def is_valid_image(filename):
+def is_valid_image(filename, filepath=None):
+    if filepath and "Archive" in filepath:
+        return False
     ext = os.path.splitext(filename)[1].lower()
     return ext in ['.jpg', '.jpeg', '.png', '.heic']
 
 def process_file(filepath):
-    if filepath in PROCESSED_FILES:
+    # Skip if in Archive or already processed
+    if file_archiver and file_archiver.is_in_archive(filepath):
+        return
+    if history_manager.is_processed(filepath):
         return
 
     # Skip files older than 7 days
@@ -54,13 +60,12 @@ def process_file(filepath):
         mtime = os.path.getmtime(filepath)
         file_date = datetime.fromtimestamp(mtime)
         if datetime.now() - file_date > timedelta(days=7):
-            PROCESSED_FILES.add(filepath)
+            history_manager.add_to_history(filepath)
             return
     except FileNotFoundError:
         return
 
     logging.info(f"Processing new file: {filepath}")
-    PROCESSED_FILES.add(filepath)
     
     time.sleep(2) # Wait for sync
     
@@ -73,8 +78,16 @@ def process_file(filepath):
             # Run validation and correction workflow
             if ENABLE_VALIDATION or ENABLE_DUPLICATE_DETECTION:
                 validate_and_correct(receipt_data, filepath)
+                
+            # Mark as processed and archive
+            history_manager.add_to_history(filepath)
+            if file_archiver:
+                file_archiver.archive_file(filepath, receipt_date=receipt_data.get("date"))
         else:
-            logging.info("No items found in receipt.")
+            logging.info("No items found in receipt. Marking as processed.")
+            history_manager.add_to_history(filepath)
+            if file_archiver:
+                file_archiver.archive_file(filepath)
     except Exception as e:
         logging.error(f"Error processing {filepath}: {e}")
 
@@ -86,6 +99,8 @@ def validate_and_correct(receipt_data, filepath):
         receipt_data: The receipt data that was just uploaded
         filepath: Path to the source image file
     """
+    if notion_validator is None:
+        return
     merchant = receipt_data.get("merchant")
     date = receipt_data.get("date")
     
@@ -178,12 +193,12 @@ def correct_errors(filepath, date, merchant):
 
 class ReceiptHandler(FileSystemEventHandler):
     def on_created(self, event):
-        if not event.is_directory and is_valid_image(event.src_path):
+        if not event.is_directory and is_valid_image(os.path.basename(event.src_path), event.src_path):
             logging.info(f"Detected creation: {event.src_path}")
             process_file(event.src_path)
 
     def on_moved(self, event):
-        if not event.is_directory and is_valid_image(event.dest_path):
+        if not event.is_directory and is_valid_image(os.path.basename(event.dest_path), event.dest_path):
             logging.info(f"Detected move/rename: {event.dest_path}")
             process_file(event.dest_path)
 
@@ -393,8 +408,8 @@ def scan_directory():
     logging.info("Polling directory for new files...")
     for root, dirs, files in os.walk(WATCH_DIR):
         for file in files:
-            if is_valid_image(file):
-                filepath = os.path.join(root, file)
+            filepath = os.path.join(root, file)
+            if is_valid_image(file, filepath):
                 process_file(filepath)
 
 if __name__ == "__main__":
@@ -420,7 +435,7 @@ if __name__ == "__main__":
                     logging.error("Configuration still missing after setup. Exiting.")
                     exit(1)
                 else:
-                    # Re-initialize clients
+                    # Re-initialize clients (module-level names)
                     client = OpenAI(api_key=OPEN_AI_API_KEY)
                     notion_validator = NotionValidator(NOTION_TOKEN, NOTION_DATABASE_ID)
             except Exception as e:
@@ -430,6 +445,9 @@ if __name__ == "__main__":
             logging.error("Setup wizard not found. Please create .env file manually.")
             exit(1)
     
+    if not WATCH_DIR:
+        logging.error("WATCH_DIR is not set in .env. Exiting.")
+        exit(1)
     logging.info(f"Monitoring Directory (Recursive): {WATCH_DIR}")
     
     # 1. Start Watchdog
