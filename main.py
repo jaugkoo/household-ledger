@@ -398,8 +398,37 @@ def scan_directory():
                 process_file(filepath)
 
 if __name__ == "__main__":
-    if not all([OPEN_AI_API_KEY, NOTION_TOKEN, NOTION_DATABASE_ID]):
-        logging.warning("Missing API keys in .env file.")
+    # Check if configuration is missing
+    config_missing = not all([OPEN_AI_API_KEY, NOTION_TOKEN, NOTION_DATABASE_ID])
+    
+    if config_missing:
+        logging.warning("Missing configuration in .env file.")
+        # Try to launch setup wizard if it exists
+        setup_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "setup_wizard.py")
+        if os.path.exists(setup_script):
+            logging.info("Launching setup wizard...")
+            try:
+                import subprocess
+                subprocess.run(["python", setup_script], check=True)
+                # Reload env after setup
+                load_dotenv(override=True)
+                OPEN_AI_API_KEY = os.getenv("OPEN_AI_API_KEY")
+                NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+                NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
+                
+                if not all([OPEN_AI_API_KEY, NOTION_TOKEN, NOTION_DATABASE_ID]):
+                    logging.error("Configuration still missing after setup. Exiting.")
+                    exit(1)
+                else:
+                    # Re-initialize clients
+                    client = OpenAI(api_key=OPEN_AI_API_KEY)
+                    notion_validator = NotionValidator(NOTION_TOKEN, NOTION_DATABASE_ID)
+            except Exception as e:
+                logging.error(f"Failed to run setup wizard: {e}")
+                exit(1)
+        else:
+            logging.error("Setup wizard not found. Please create .env file manually.")
+            exit(1)
     
     logging.info(f"Monitoring Directory (Recursive): {WATCH_DIR}")
     
