@@ -24,25 +24,68 @@ This is a Python automation script that monitors a OneDrive folder for receipt p
 
 ## Installation
 
+### Quick Install (Recommended)
+
+1. **Run the installer**:
+   ```powershell
+   install.bat
+   ```
+
+2. **Enter your credentials** in the setup wizard:
+   - OpenAI API Key
+   - Notion Integration Token
+   - Notion Database ID
+   - Watch directory (default: OneDrive Camera Roll)
+
+3. **Done!** The program will auto-start when Windows boots.
+
+### Manual Installation
+
 1.  Clone this repository or download the code.
 2.  Open a terminal (PowerShell or CMD) in the project folder.
 3.  Install dependencies:
     ```powershell
     pip install -r requirements.txt
     ```
-4.  Configure `.env` file:
+4.  Run setup wizard:
+    ```powershell
+    python setup_wizard.py
+    ```
+5.  Or manually configure `.env` file:
     -   Copy `.env.example` to `.env`.
     -   Fill in your `OPEN_AI_API_KEY`, `NOTION_TOKEN`, and `NOTION_DATABASE_ID`.
 
 ## Usage
 
-Run the script directly from your terminal:
+### Auto-Start (After Installation)
+
+The program automatically starts when Windows boots. No action needed!
+
+### Manual Start
+
+Run the script directly:
+
+```powershell
+start.bat
+```
+
+Or from terminal:
 
 ```powershell
 python main.py
 ```
 
 The script will start monitoring. Simply take a photo of a receipt (which syncs to OneDrive), and it will be processed automatically.
+
+### Change Settings
+
+To modify API keys or settings:
+
+```powershell
+python setup_wizard.py
+```
+
+Or edit the `.env` file directly.
 
 ## Configuration
 
@@ -62,7 +105,23 @@ ENABLE_AUTO_CORRECTION=true      # Re-analyzes images when errors are detected
 
 ## Files
 
+### Main Files
 -   `main.py`: The main automation script.
 -   `notion_validator.py`: Data validation and duplicate detection module.
+
+### Installation & Setup
+-   `install.bat`: One-click installer with auto-start setup.
+-   `setup_wizard.py`: GUI configuration tool.
+-   `start.bat`: Manual start script.
+-   `uninstall.bat`: Remove auto-start configuration.
+
+### Documentation
+-   `README.md`: English documentation.
+-   `사용가이드.md`: Korean user guide (comprehensive).
+-   `빠른사용법.md`: Korean quick reference.
+-   `QUICK_START.md`: Quick start guide.
+
+### Configuration
 -   `requirements.txt`: Python package dependencies.
 -   `.env`: Configuration file (Do not share this file).
+-   `.env.example`: Configuration template.
