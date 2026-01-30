@@ -8,6 +8,11 @@ This is a Python automation script that monitors a OneDrive folder for receipt p
 -   **AI Analysis**: Extracts Date, Merchant, Items, Unit Price, Quantity, and Category from receipt photos.
 -   **Notion Integration**: Uploads each item as a separate row in your Notion Household Ledger.
 -   **Duplicate Prevention**: Skips files that have already been processed (in the current session).
+-   **Data Validation**: Automatically validates uploaded data for quality issues (missing fields, invalid dates, negative prices).
+-   **Duplicate Detection**: Finds and removes duplicate entries based on item name, date, merchant, and price.
+-   **Error Correction**: Automatically re-analyzes images and corrects data when validation errors are detected.
+-   **Date-Based Organization**: Ensures all entries have valid dates for proper chronological sorting.
+-   **Source Tracking**: Tracks which image file each entry came from for accurate error correction.
 
 ## Prerequisites
 
@@ -39,8 +44,25 @@ python main.py
 
 The script will start monitoring. Simply take a photo of a receipt (which syncs to OneDrive), and it will be processed automatically.
 
+## Configuration
+
+You can customize the validation behavior by editing the `.env` file:
+
+```env
+# Validation Settings
+ENABLE_VALIDATION=true           # Validates data quality (dates, prices, required fields)
+ENABLE_DUPLICATE_DETECTION=true  # Automatically removes duplicate entries
+ENABLE_AUTO_CORRECTION=true      # Re-analyzes images when errors are detected
+```
+
+**How it works:**
+1. **Validation**: Checks each uploaded entry for missing fields, invalid dates, and negative prices
+2. **Duplicate Detection**: Finds entries with identical item name, date, merchant, and price, keeping only the newest
+3. **Auto Correction**: When validation errors are found, the system re-analyzes the image with an enhanced prompt, deletes the incorrect data, and uploads corrected data
+
 ## Files
 
 -   `main.py`: The main automation script.
+-   `notion_validator.py`: Data validation and duplicate detection module.
 -   `requirements.txt`: Python package dependencies.
 -   `.env`: Configuration file (Do not share this file).

@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from openai import OpenAI
+from notion_validator import NotionValidator
 
 # Setup logging
 logging.basicConfig(level=logging.INFO,
@@ -23,11 +24,22 @@ NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 WATCH_DIR = os.getenv("WATCH_DIR")
 
+# Validation settings
+ENABLE_VALIDATION = os.getenv("ENABLE_VALIDATION", "true").lower() == "true"
+ENABLE_DUPLICATE_DETECTION = os.getenv("ENABLE_DUPLICATE_DETECTION", "true").lower() == "true"
+ENABLE_AUTO_CORRECTION = os.getenv("ENABLE_AUTO_CORRECTION", "true").lower() == "true"
+
 # Initialize OpenAI client
 client = OpenAI(api_key=OPEN_AI_API_KEY)
 
+# Initialize Notion Validator
+notion_validator = NotionValidator(NOTION_TOKEN, NOTION_DATABASE_ID)
+
 # Keep track of processed files to avoid duplicates
 PROCESSED_FILES = set()
+
+# Track image file paths for error correction
+IMAGE_FILE_TRACKER = {}  # {(date, merchant): filepath}
 
 def is_valid_image(filename):
     ext = os.path.splitext(filename)[1].lower()
@@ -55,11 +67,114 @@ def process_file(filepath):
     try:
         receipt_data = analyze_receipt(filepath)
         if receipt_data and "items" in receipt_data:
-             add_items_to_notion(receipt_data)
+            # Upload to Notion with source file tracking
+            add_items_to_notion(receipt_data, source_filepath=filepath)
+            
+            # Run validation and correction workflow
+            if ENABLE_VALIDATION or ENABLE_DUPLICATE_DETECTION:
+                validate_and_correct(receipt_data, filepath)
         else:
             logging.info("No items found in receipt.")
     except Exception as e:
         logging.error(f"Error processing {filepath}: {e}")
+
+def validate_and_correct(receipt_data, filepath):
+    """
+    Validate uploaded data and correct errors if needed
+    
+    Args:
+        receipt_data: The receipt data that was just uploaded
+        filepath: Path to the source image file
+    """
+    merchant = receipt_data.get("merchant")
+    date = receipt_data.get("date")
+    
+    # Step 1: Check for duplicates
+    if ENABLE_DUPLICATE_DETECTION:
+        logging.info("Checking for duplicate entries...")
+        try:
+            duplicates_removed = notion_validator.remove_duplicates()
+            if duplicates_removed > 0:
+                logging.info(f"Removed {duplicates_removed} duplicate entries")
+        except Exception as e:
+            logging.error(f"Error during duplicate detection: {e}")
+    
+    # Step 2: Validate data quality
+    if ENABLE_VALIDATION:
+        logging.info("Validating data quality...")
+        try:
+            # Get entries from this receipt
+            if filepath:
+                entry_ids = notion_validator.find_entries_by_source(filepath)
+            else:
+                entry_ids = notion_validator.find_entries_by_date_merchant(date, merchant)
+            
+            if not entry_ids:
+                logging.warning("Could not find uploaded entries for validation")
+                return
+            
+            # Validate each entry
+            entries = notion_validator.get_all_entries()
+            has_errors = False
+            
+            for entry in entries:
+                if entry.get("id") in entry_ids:
+                    errors = notion_validator.validate_entry(entry)
+                    if errors:
+                        has_errors = True
+                        item_name = notion_validator.extract_property_value(entry, "항목")
+                        logging.warning(f"Validation errors for '{item_name}': {', '.join(errors)}")
+            
+            # Step 3: Auto-correct if errors found
+            if has_errors and ENABLE_AUTO_CORRECTION:
+                logging.info("Validation errors detected. Starting auto-correction...")
+                correct_errors(filepath, date, merchant)
+            elif has_errors:
+                logging.warning("Validation errors found but auto-correction is disabled")
+                
+        except Exception as e:
+            logging.error(f"Error during validation: {e}")
+
+def correct_errors(filepath, date, merchant):
+    """
+    Correct errors by re-analyzing image and replacing data
+    
+    Args:
+        filepath: Path to the source image file
+        date: Receipt date
+        merchant: Merchant name
+    """
+    logging.info("Re-analyzing image for error correction...")
+    
+    try:
+        # Step 1: Re-analyze with enhanced prompt
+        corrected_data = analyze_receipt(filepath, is_retry=True)
+        
+        if not corrected_data or not corrected_data.get("items"):
+            logging.error("Re-analysis failed to extract data")
+            return
+        
+        # Step 2: Delete old incorrect entries
+        logging.info("Deleting old incorrect entries...")
+        if filepath:
+            old_entry_ids = notion_validator.find_entries_by_source(filepath)
+        else:
+            old_entry_ids = notion_validator.find_entries_by_date_merchant(date, merchant)
+        
+        deleted_count = 0
+        for entry_id in old_entry_ids:
+            if notion_validator.delete_entry(entry_id):
+                deleted_count += 1
+        
+        logging.info(f"Deleted {deleted_count} old entries")
+        
+        # Step 3: Upload corrected data
+        logging.info("Uploading corrected data...")
+        add_items_to_notion(corrected_data, source_filepath=filepath)
+        logging.info("Error correction completed successfully")
+        
+    except Exception as e:
+        logging.error(f"Error during auto-correction: {e}")
 
 class ReceiptHandler(FileSystemEventHandler):
     def on_created(self, event):
@@ -76,37 +191,78 @@ def encode_image(image_path):
     with open(image_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode('utf-8')
 
-def analyze_receipt(image_path):
-    logging.info("Analyzing image with AI...")
+def analyze_receipt(image_path, is_retry=False):
+    """
+    Analyze receipt image with AI
+    
+    Args:
+        image_path: Path to the receipt image
+        is_retry: If True, use enhanced prompt for error correction
+    """
+    logging.info(f"Analyzing image with AI... (retry={is_retry})")
     try:
         base64_image = encode_image(image_path)
     except Exception as e:
         logging.error(f"Failed to read image: {e}")
         return None
 
-    # Prompt for itemized extraction
-    prompt = """
-    Analyze this receipt image and extract the following information.
-    Return a JSON object with this structure:
-    {
-        "merchant": "Merchant Name",
-        "date": "YYYY-MM-DD",
-        "items": [
-            {
-                "name": "Item Name",
-                "quantity": 1,
-                "unit_price": 1000,
-                "total_price": 1000,
-                "category": "One of: 식재료, 가공식품, 간식, 채소, 과일, 생활용품, 기타"
-            }
-        ]
-    }
-    - "merchant": The store name.
-    - "date": The transaction date.
-    - "items": Array of purchased items.
-    - "category": Infer the category based on the item name from the given list.
-    - Remove currency symbols from prices.
-    """
+    # Enhanced prompt for retry attempts
+    if is_retry:
+        prompt = """
+        IMPORTANT: This is a re-analysis due to data quality issues. Please be extra careful and accurate.
+        
+        Analyze this receipt image and extract the following information.
+        Return a JSON object with this structure:
+        {
+            "merchant": "Merchant Name",
+            "date": "YYYY-MM-DD",
+            "items": [
+                {
+                    "name": "Item Name",
+                    "quantity": 1,
+                    "unit_price": 1000,
+                    "total_price": 1000,
+                    "category": "One of: 식재료, 가공식품, 간식, 채소, 과일, 생활용품, 기타"
+                }
+            ]
+        }
+        
+        CRITICAL REQUIREMENTS:
+        - "merchant": Extract the EXACT store name from the receipt.
+        - "date": Must be in YYYY-MM-DD format. Double-check the date.
+        - "items": Extract ALL items, do not skip any.
+        - "name": Use the exact item name from the receipt.
+        - "quantity": Must be a positive integer.
+        - "unit_price" and "total_price": Must be positive numbers. Remove all currency symbols (₩, 원, etc.).
+        - "category": Choose the MOST APPROPRIATE category from: 식재료, 가공식품, 간식, 채소, 과일, 생활용품, 기타
+        
+        Double-check all numbers and ensure no fields are missing.
+        """
+    else:
+        # Standard prompt for first attempt
+        prompt = """
+        Analyze this receipt image and extract the following information.
+        Return a JSON object with this structure:
+        {
+            "merchant": "Merchant Name",
+            "date": "YYYY-MM-DD",
+            "items": [
+                {
+                    "name": "Item Name",
+                    "quantity": 1,
+                    "unit_price": 1000,
+                    "total_price": 1000,
+                    "category": "One of: 식재료, 가공식품, 간식, 채소, 과일, 생활용품, 기타"
+                }
+            ]
+        }
+        - "merchant": The store name.
+        - "date": The transaction date in YYYY-MM-DD format.
+        - "items": Array of purchased items.
+        - "category": Infer the category based on the item name from the given list.
+        - Remove currency symbols from prices.
+        - Ensure all prices are positive numbers.
+        """
 
     try:
         response = client.chat.completions.create(
@@ -140,7 +296,14 @@ def analyze_receipt(image_path):
              logging.error(f"OpenAI Response: {e.response}")
         return None
 
-def add_items_to_notion(data):
+def add_items_to_notion(data, source_filepath=None):
+    """
+    Upload items to Notion database
+    
+    Args:
+        data: Receipt data with merchant, date, and items
+        source_filepath: Path to the source image file (for error correction tracking)
+    """
     if not data or not data.get("items"):
         return
 
@@ -155,6 +318,10 @@ def add_items_to_notion(data):
 
     merchant_name = data.get("merchant") or "Unknown"
     receipt_date = data.get("date")
+    
+    # Track this image file for error correction
+    if receipt_date and merchant_name and source_filepath:
+        IMAGE_FILE_TRACKER[(receipt_date, merchant_name)] = source_filepath
 
     success_count = 0
     
@@ -197,6 +364,14 @@ def add_items_to_notion(data):
                 }
             }
         }
+        
+        # Add source file tracking if available
+        if source_filepath:
+            payload["properties"]["원본파일"] = {
+                "rich_text": [
+                    {"text": {"content": source_filepath}}
+                ]
+            }
         
         # Remove Date if None to avoid error
         if payload["properties"]["날짜"] is None:
