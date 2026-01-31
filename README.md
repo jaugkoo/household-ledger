@@ -105,6 +105,23 @@ ENABLE_AUTO_CORRECTION=true      # Re-analyzes images when errors are detected
 2. **Duplicate Detection**: Finds entries with identical item name, date, merchant, and price, keeping only the newest
 3. **Auto Correction**: When validation errors are found, the system re-analyzes the image with an enhanced prompt, deletes the incorrect data, and uploads corrected data
 
+## Troubleshooting: 사진이 노션에 추가되지 않을 때
+
+프로그램을 **콘솔에서 실행**하면 (`python main.py`) 로그로 이유를 확인할 수 있습니다.
+
+| 로그 메시지 | 원인 | 해결 |
+|------------|------|------|
+| `[건너뜀] 이미 처리된 파일` | 이전에 처리된 파일 | `.processed_history`에서 해당 경로를 삭제하거나, 새 사진으로 시도 |
+| `[건너뜀] 7일 초과 파일` | 파일 수정일이 7일보다 오래됨 (OneDrive는 촬영일 기준일 수 있음) | `.env`에 `MAX_FILE_AGE_DAYS=30` 등으로 늘리기 |
+| `[건너뜀] 파일 없음` / `파일 크기 0바이트` | OneDrive 동기화가 아직 안 됨 | 사진 업로드 후 몇 분 기다리거나, 동기화 완료 후 다시 시도 |
+| `AI 분석 결과 없음` | OpenAI API 오류 또는 이미지 인식 실패 | API 키·크레딧 확인, 이미지가 영수증인지·선명한지 확인 |
+| `Failed to add item` (Notion) | Notion 토큰·DB ID 오류 또는 DB 속성 불일치 | `.env`의 `NOTION_TOKEN`, `NOTION_DATABASE_ID` 및 DB 속성명 확인 |
+
+**확인할 것:**
+1. **WATCH_DIR**: `.env`의 감시 폴더가 **사진을 올리는 OneDrive 폴더 경로**와 동일한지 확인 (예: `C:\Users\...\OneDrive\사진\카메라 앨범`).
+2. **파일 형식**: `.jpg`, `.jpeg`, `.png`, `.heic`만 처리됩니다.
+3. **Archive 폴더**: 이미 처리되어 `Archive` 안으로 옮겨진 파일은 다시 처리되지 않습니다.
+
 ## Files
 
 ### Main Files

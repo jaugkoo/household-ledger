@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .env
+.processed_history
 .DS_Store
 test_validator.py
 *.log

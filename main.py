@@ -3,6 +3,7 @@ import time
 import base64
 import json
 import logging
+import threading
 import requests
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -12,6 +13,22 @@ from openai import OpenAI
 from notion_validator import NotionValidator
 from history_manager import HistoryManager
 from archiver import FileArchiver
+
+# 상태창이 닫히면 메인 루프 종료용 (스레드 간 공유)
+status_window_running = True
+# 상태창에 표시할 진행 상황 (메인 스레드가 갱신, GUI 스레드가 주기적으로 읽음)
+status_display = {"file": "", "status": "실행 중 · 감시 대기", "error": ""}
+status_display_lock = threading.Lock()
+
+def set_status(file=None, status=None, error=None):
+    """상태창용 메시지 갱신 (메인 스레드에서 호출)."""
+    with status_display_lock:
+        if file is not None:
+            status_display["file"] = file
+        if status is not None:
+            status_display["status"] = status
+        if error is not None:
+            status_display["error"] = error
 
 # Setup logging
 logging.basicConfig(level=logging.INFO,
@@ -51,45 +68,88 @@ def is_valid_image(filename, filepath=None):
 def process_file(filepath):
     # Skip if in Archive or already processed
     if file_archiver and file_archiver.is_in_archive(filepath):
+        logging.info(f"[건너뜀] 아카이브 폴더 안의 파일: {filepath}")
         return
     if history_manager.is_processed(filepath):
+        logging.info(f"[건너뜀] 이미 처리된 파일: {filepath}")
         return
 
-    # Skip files older than 7 days
+    # Skip files older than N days (OneDrive 동기화 시 촬영일 기준일 수 있음)
+    max_age_days = int(os.getenv("MAX_FILE_AGE_DAYS", "7"))
     try:
         mtime = os.path.getmtime(filepath)
         file_date = datetime.fromtimestamp(mtime)
-        if datetime.now() - file_date > timedelta(days=7):
+        if datetime.now() - file_date > timedelta(days=max_age_days):
+            logging.info(f"[건너뜀] {max_age_days}일 초과 파일 (수정일 {file_date.date()}): {filepath}")
             history_manager.add_to_history(filepath)
             return
     except FileNotFoundError:
+        logging.warning(f"[건너뜀] 파일 없음 (동기화 대기 중?): {filepath}")
         return
 
     logging.info(f"Processing new file: {filepath}")
+    short_name = os.path.basename(filepath)
+    set_status(file=short_name, status="동기화 대기 중...", error="")
     
-    time.sleep(2) # Wait for sync
+    # OneDrive 등 동기화 완료 대기 (placeholder 해제 대기)
+    time.sleep(5)
+    if not os.path.exists(filepath):
+        set_status(status="건너뜀", error="대기 후에도 파일 없음 (동기화 미완료?)")
+        logging.warning(f"[건너뜀] 대기 후에도 파일 없음: {filepath}")
+        return
+    try:
+        if os.path.getsize(filepath) == 0:
+            set_status(status="건너뜀", error="파일 크기 0바이트 (동기화 미완료?)")
+            logging.warning(f"[건너뜀] 파일 크기 0바이트 (동기화 미완료?): {filepath}")
+            return
+    except OSError:
+        return
     
     try:
+        set_status(status="AI 분석 중...", error="")
         receipt_data = analyze_receipt(filepath)
-        if receipt_data and "items" in receipt_data:
-            # Upload to Notion with source file tracking
-            add_items_to_notion(receipt_data, source_filepath=filepath)
-            
-            # Run validation and correction workflow
-            if ENABLE_VALIDATION or ENABLE_DUPLICATE_DETECTION:
-                validate_and_correct(receipt_data, filepath)
-                
-            # Mark as processed and archive
-            history_manager.add_to_history(filepath)
-            if file_archiver:
-                file_archiver.archive_file(filepath, receipt_date=receipt_data.get("date"))
-        else:
+        if not receipt_data:
+            set_status(status="실패", error="AI 분석 결과 없음 (API/이미지 확인)")
+            logging.warning(f"AI 분석 결과 없음 (이미지/API 오류 가능): {filepath}")
+            return
+        if not receipt_data.get("items"):
+            set_status(status="완료(항목 없음)", error="")
             logging.info("No items found in receipt. Marking as processed.")
             history_manager.add_to_history(filepath)
             if file_archiver:
                 file_archiver.archive_file(filepath)
+            return
+        set_status(status="노션 업로드 중...", error="")
+        success_count, notion_error = add_items_to_notion(receipt_data, source_filepath=filepath)
+        total_items = len(receipt_data.get("items", []))
+        if success_count == 0 and notion_error:
+            set_status(status="노션 업로드 실패", error=notion_error)
+            logging.error(f"Notion에 추가된 항목 없음: {notion_error}")
+            return
+        if success_count < total_items and notion_error:
+            set_status(status=f"일부만 추가됨 ({success_count}/{total_items})", error=notion_error)
+        if success_count == total_items and notion_error is None:
+            set_status(status="노션 업로드 완료", error="")
+        if ENABLE_VALIDATION or ENABLE_DUPLICATE_DETECTION:
+            set_status(status="검증 중...", error="")
+            validate_and_correct(receipt_data, filepath)
+        history_manager.add_to_history(filepath)
+        if file_archiver:
+            file_archiver.archive_file(filepath, receipt_date=receipt_data.get("date"))
+        if success_count == total_items:
+            set_status(status="완료", error="")
+        else:
+            set_status(status=f"완료 (노션 {success_count}/{total_items}개)", error=notion_error or "")
     except Exception as e:
-        logging.error(f"Error processing {filepath}: {e}")
+        import traceback
+        err_msg = str(e)
+        tb = traceback.format_exc()
+        if len(tb) > 400:
+            err_msg = err_msg + "\n" + tb[-400:]
+        else:
+            err_msg = err_msg + "\n" + tb
+        set_status(status="오류", error=err_msg)
+        logging.exception(f"Error processing {filepath}: {e}")
 
 def validate_and_correct(receipt_data, filepath):
     """
@@ -313,14 +373,13 @@ def analyze_receipt(image_path, is_retry=False):
 
 def add_items_to_notion(data, source_filepath=None):
     """
-    Upload items to Notion database
-    
-    Args:
-        data: Receipt data with merchant, date, and items
-        source_filepath: Path to the source image file (for error correction tracking)
+    Upload items to Notion database.
+
+    Returns:
+        tuple: (success_count, error_message). error_message is set on first failure.
     """
     if not data or not data.get("items"):
-        return
+        return (0, None)
 
     logging.info("Uploading items to Notion...")
     url = "https://api.notion.com/v1/pages"
@@ -339,6 +398,7 @@ def add_items_to_notion(data, source_filepath=None):
         IMAGE_FILE_TRACKER[(receipt_date, merchant_name)] = source_filepath
 
     success_count = 0
+    first_error = None
     
     for item in data["items"]:
         item_name = item.get("name") or "Unknown Item"
@@ -380,13 +440,10 @@ def add_items_to_notion(data, source_filepath=None):
             }
         }
         
-        # Add source file tracking if available
-        if source_filepath:
-            payload["properties"]["원본파일"] = {
-                "rich_text": [
-                    {"text": {"content": source_filepath}}
-                ]
-            }
+        # 원본파일은 DB에 해당 속성이 있을 때만 사용 (없으면 400 오류). 현재는 전송하지 않음.
+        # 필요 시 노션 DB에 "원본파일" rich_text 속성을 추가한 뒤 아래 주석 해제.
+        # if source_filepath:
+        #     payload["properties"]["원본파일"] = {"rich_text": [{"text": {"content": source_filepath}}]}
         
         # Remove Date if None to avoid error
         if payload["properties"]["날짜"] is None:
@@ -397,11 +454,18 @@ def add_items_to_notion(data, source_filepath=None):
             if response.status_code == 200:
                 success_count += 1
             else:
+                err = f"Notion API {response.status_code}: {response.text[:300]}"
+                if not first_error:
+                    first_error = err
                 logging.error(f"Failed to add item '{item_name}': {response.status_code} - {response.text}")
         except Exception as e:
+            err = f"Notion 요청 오류: {e}"
+            if not first_error:
+                first_error = err
             logging.error(f"Notion API Error: {e}")
             
     logging.info(f"Successfully added {success_count} / {len(data['items'])} items to Notion.")
+    return (success_count, first_error)
 
 def scan_directory():
     """Manual scan to catch missed files"""
@@ -411,6 +475,76 @@ def scan_directory():
             filepath = os.path.join(root, file)
             if is_valid_image(file, filepath):
                 process_file(filepath)
+
+
+def run_status_window(watch_dir):
+    """작은 확인창: 실행 중인 파일명, 진행 상황, 에러 메시지 표시."""
+    global status_window_running
+    try:
+        import tkinter as tk
+    except ImportError:
+        logging.warning("tkinter not available, status window disabled.")
+        return
+    root = tk.Tk()
+    root.title("Receipt Automation")
+    root.resizable(True, True)
+    root.minsize(320, 220)
+    root.maxsize(480, 360)
+    root.attributes("-topmost", True)
+    root.geometry("340x240")
+    # 창 닫기 시 플래그 설정 후 종료
+    def on_closing():
+        global status_window_running
+        status_window_running = False
+        root.quit()
+        root.destroy()
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+    frame = tk.Frame(root, padx=12, pady=10)
+    frame.pack(fill=tk.BOTH, expand=True)
+    # 상단: 감시 폴더
+    dir_text = (watch_dir[: 38] + "…") if watch_dir and len(watch_dir) > 38 else (watch_dir or "-")
+    label_dir = tk.Label(frame, text=f"감시: {dir_text}", font=("Segoe UI", 8), fg="#555")
+    label_dir.pack(anchor=tk.W)
+    # 현재 파일
+    label_file = tk.Label(frame, text="", font=("Segoe UI", 10, "bold"), fg="#1a1a1a")
+    label_file.pack(anchor=tk.W)
+    # 진행 상황
+    label_status = tk.Label(frame, text="실행 중 · 감시 대기", font=("Segoe UI", 10), fg="#2e7d32")
+    label_status.pack(anchor=tk.W)
+    # 에러 영역 (최대 4줄, 자동 줄바꿈)
+    err_frame = tk.Frame(frame)
+    err_frame.pack(anchor=tk.W, fill=tk.BOTH, expand=True)
+    label_error = tk.Label(err_frame, text="", font=("Segoe UI", 8), fg="#c62828", justify=tk.LEFT, wraplength=300)
+    label_error.pack(anchor=tk.NW, fill=tk.BOTH, expand=True)
+    # 하단 안내
+    hint = tk.Label(frame, text="창을 닫으면 프로그램이 종료됩니다.", font=("Segoe UI", 8), fg="#888")
+    hint.pack(anchor=tk.SW)
+    # 주기적으로 상태 갱신
+    def update_status():
+        try:
+            with status_display_lock:
+                data = {
+                    "file": status_display.get("file", ""),
+                    "status": status_display.get("status", ""),
+                    "error": status_display.get("error", "")
+                }
+        except Exception:
+            data = {"file": "", "status": "", "error": ""}
+        label_file.config(text=data["file"] or "(대기 중)")
+        label_status.config(text=data["status"] or "-")
+        if data["status"] in ("오류", "실패", "건너뜀", "노션 업로드 실패", "일부만 추가됨") or "실패" in (data["status"] or ""):
+            label_status.config(fg="#c62828")
+        else:
+            label_status.config(fg="#2e7d32")
+        err_text = (data["error"] or "").strip()
+        if len(err_text) > 500:
+            err_text = err_text[:500] + "…"
+        label_error.config(text=err_text or "-")
+        root.after(500, update_status)
+    root.after(300, update_status)
+    root.mainloop()
+    status_window_running = False
+
 
 if __name__ == "__main__":
     # Check if configuration is missing
@@ -450,6 +584,11 @@ if __name__ == "__main__":
         exit(1)
     logging.info(f"Monitoring Directory (Recursive): {WATCH_DIR}")
     
+    # 0. 실행 상태 확인창 (별도 스레드)
+    status_window_running = True
+    status_thread = threading.Thread(target=run_status_window, args=(WATCH_DIR,), daemon=True)
+    status_thread.start()
+    
     # 1. Start Watchdog
     event_handler = ReceiptHandler()
     observer = Observer()
@@ -457,11 +596,16 @@ if __name__ == "__main__":
     observer.start()
     
     try:
-        while True:
+        while status_window_running:
             # 2. Periodic Poll
             scan_directory()
-            time.sleep(60)
-            
+            for _ in range(60):
+                if not status_window_running:
+                    break
+                time.sleep(1)
     except KeyboardInterrupt:
+        status_window_running = False
+    finally:
         observer.stop()
     observer.join()
+    logging.info("Receipt Automation 종료됨.")
